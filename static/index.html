@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Talk to {{NAME}}</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Onest:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+  :root { --bg:#f2f3f5; --card:#fff; --text:#17181a; --hint:#6b7076; --blue:#2e6ae6; --red:#e5484d; --track:#e7e9ec; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html, body { height:100%; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family:Onest,-apple-system,Segoe UI,Roboto,sans-serif; }
+  .wrap { max-width:520px; margin:0 auto; padding:24px 16px 28px; min-height:100%; display:flex; flex-direction:column; }
+  .hint { color:var(--hint); font-size:15px; }
+  h1 { font-size:28px; font-weight:800; letter-spacing:-.02em; margin:4px 0 0; }
+  .status { font-size:17px; font-weight:600; margin-top:6px; min-height:24px; }
+  .status.err { color:var(--red); }
+  .center { flex:1; display:flex; align-items:center; justify-content:center; padding:28px 0; }
+  .btn { width:176px; height:176px; border-radius:50%; border:0; background:var(--blue); color:#fff; font:inherit;
+         font-size:21px; font-weight:700; box-shadow:0 10px 30px rgba(46,106,230,.28); transition:transform .15s, background .2s; }
+  .btn:active { transform:scale(.96); }
+  .btn.on { background:var(--red); box-shadow:0 10px 30px rgba(229,72,77,.28); }
+  .btn:disabled { opacity:.6; }
+  .btn.talk { animation:pulse 1.2s ease-in-out infinite; }
+  @keyframes pulse { 50% { box-shadow:0 0 0 18px rgba(229,72,77,.12), 0 10px 30px rgba(229,72,77,.28); } }
+  .card { background:var(--card); border-radius:24px; padding:16px 18px; box-shadow:0 6px 24px rgba(23,24,26,.06);
+          max-height:38vh; overflow-y:auto; }
+  .line { padding:6px 0; font-size:16px; line-height:1.4; }
+  .line b { font-weight:700; margin-right:6px; }
+  .line.bot b { color:var(--blue); }
+  .line.me b { color:var(--hint); }
+  .time { font-variant-numeric:tabular-nums; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="hint">Voice chat</div>
+  <h1>{{NAME}}</h1>
+  <div class="status" id="st">Tap “Talk”</div>
+  <div class="center"><button class="btn" id="btn">Talk</button></div>
+  <div class="card" id="subs"><div class="hint">Live subtitles appear here. The transcript is saved when you finish.</div></div>
+  <div class="hint time" id="tm" style="margin-top:12px"></div>
+</div>
+<script>
+const TG = window.Telegram && Telegram.WebApp;
+try { TG.ready(); TG.expand(); TG.setHeaderColor("#f2f3f5"); TG.setBackgroundColor("#f2f3f5"); } catch (e) {}
+const INIT = (TG && TG.initData) || "";
+const NAME = "{{NAME}}";
+const $ = id => document.getElementById(id);
+let pc = null, dc = null, mic = null, audio = null, t0 = 0, tick = null, sent = true, sid = "";
+let lines = [], byId = {}, heard = false;
+const hhmmss = () => new Date().toLocaleTimeString("en-GB", { hour12: false });
+
+function status(t, err) { $("st").textContent = t; $("st").className = "status" + (err ? " err" : ""); }
+function esc(s) { return s.replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]); }
+function draw() {
+  const box = $("subs");
+  box.innerHTML = lines.filter(l => l.text).slice(-12).map(l =>
+    `<div class="line ${l.who === "bot" ? "bot" : "me"}"><b>${l.who === "bot" ? NAME : "You"}</b>${esc(l.text)}</div>`).join("")
+    || '<div class="hint">Listening…</div>';
+  box.scrollTop = box.scrollHeight;
+}
+function line(id, who) {
+  if (!byId[id]) { byId[id] = { t: hhmmss(), who, text: "" }; lines.push(byId[id]); }
+  return byId[id];
+}
+
+function onEvent(e) {
+  const m = JSON.parse(e.data);
+  switch (m.type) {
+    case "input_audio_buffer.speech_started":
+      heard = true; line(m.item_id, "user"); status("Listening"); break;
+    case "conversation.item.input_audio_transcription.delta":
+      line(m.item_id, "user").text += m.delta || ""; draw(); break;
+    case "conversation.item.input_audio_transcription.completed":
+      line(m.item_id, "user").text = (m.transcript || "").trim(); draw(); break;
+    case "response.created":
+      status(NAME + " is speaking"); $("btn").classList.add("talk"); break;
+    case "response.output_audio_transcript.delta": case "response.audio_transcript.delta":
+      line(m.item_id, "bot").text += m.delta || ""; draw(); break;
+    case "response.output_audio_transcript.done": case "response.audio_transcript.done":
+      line(m.item_id, "bot").text = (m.transcript || "").trim(); draw(); break;
+    case "output_audio_buffer.stopped": case "output_audio_buffer.cleared":
+      $("btn").classList.remove("talk"); if (pc) status("Listening"); break;
+    case "error":
+      console.warn(m); if (m.error && m.error.code !== "response_cancel_not_active") status("Error: " + (m.error.message || ""), true); break;
+  }
+}
+
+async function start() {
+  const b = $("btn");
+  if (!INIT) { status("Open this page from the Telegram bot", true); return; }
+  b.disabled = true; status("Connecting…");
+  try {
+    mic = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+  } catch (e) { b.disabled = false; status("No microphone access. Allow it for Telegram in the phone settings", true); return; }
+  try {
+    const r = await fetch("/api/token", { method: "POST", headers: { Authorization: "tma " + INIT } });
+    if (!r.ok) throw new Error(r.status === 401 || r.status === 403 ? "access denied" : "server " + r.status);
+    const k = await r.json();
+    pc = new RTCPeerConnection();
+    audio = document.createElement("audio"); audio.autoplay = true; audio.playsInline = true; document.body.appendChild(audio);
+    pc.ontrack = ev => { audio.srcObject = ev.streams[0]; };
+    mic.getTracks().forEach(t => pc.addTrack(t, mic));
+    dc = pc.createDataChannel("oai-events");
+    dc.onmessage = onEvent;
+    dc.onopen = () => {
+      status("Speak");
+      // Greet first only if the user is silent for 1.5 s, otherwise their "hello" would interrupt the greeting
+      setTimeout(() => { if (dc && dc.readyState === "open" && !heard) dc.send(JSON.stringify({ type: "response.create",
+        response: { instructions: "Greet the user in one short sentence and ask how you can help." } })); }, 1500);
+    };
+    pc.onconnectionstatechange = () => { if (pc && ["failed", "disconnected"].includes(pc.connectionState)) stop("Connection lost"); };
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    const a = await fetch("https://api.openai.com/v1/realtime/calls?model=" + encodeURIComponent(k.model), {
+      method: "POST", body: offer.sdp, headers: { Authorization: "Bearer " + k.value, "Content-Type": "application/sdp" } });
+    if (!a.ok) throw new Error("OpenAI " + a.status);
+    await pc.setRemoteDescription({ type: "answer", sdp: await a.text() });
+    sid = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+    lines = []; byId = {}; heard = false; sent = false; t0 = Date.now(); draw();
+    tick = setInterval(() => { const s = Math.round((Date.now() - t0) / 1000); $("tm").textContent = Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0"); }, 1000);
+    b.textContent = "Finish"; b.classList.add("on"); b.disabled = false;
+    try { TG.enableClosingConfirmation(); } catch (e) {}
+  } catch (e) {
+    cleanup(); b.disabled = false; status("Could not connect: " + e.message, true);
+  }
+}
+
+function cleanup() {
+  clearInterval(tick);
+  try { dc && dc.close(); } catch (e) {}
+  try { pc && pc.close(); } catch (e) {}
+  if (mic) mic.getTracks().forEach(t => t.stop());
+  if (audio) { audio.srcObject = null; audio.remove(); }
+  pc = dc = mic = audio = null;
+  try { TG.disableClosingConfirmation(); } catch (e) {}
+}
+
+function sendItog() {
+  if (sent) return; sent = true;
+  const turns = lines.filter(l => l.text.trim());
+  if (!turns.length) return;
+  return fetch("/api/transcript", { method: "POST", keepalive: true,
+    headers: { "Content-Type": "application/json", Authorization: "tma " + INIT },
+    body: JSON.stringify({ sid, initData: INIT, started: new Date(t0).toISOString(), ended: new Date().toISOString(),
+                           seconds: Math.round((Date.now() - t0) / 1000), turns }) });
+}
+
+async function stop(why) {
+  const b = $("btn");
+  cleanup();
+  b.textContent = "Talk"; b.classList.remove("on", "talk");
+  const p = sendItog();
+  status(why ? why + ". Transcript saved" : "Transcript saved");
+  if (p) p.then(r => { if (!r.ok) status("Transcript not saved (" + r.status + ")", true); }).catch(() => status("Transcript not saved: no network", true));
+}
+
+$("btn").onclick = () => pc ? stop() : start();
+window.addEventListener("pagehide", () => { if (pc) { cleanup(); sendItog(); } });
+</script>
+</body>
+</html>
